@@ -3,6 +3,8 @@
 A `no_std` Rust firmware for the ESP32-C6 that drives a Pimoroni Inky pHat
 e-paper display and counts down the days to **Fettisdag**.
 
+![esp32c6-semla](resources/esp32c6-semla.jpg)
+
 ## How it works
 
 1. **Wi-Fi** — connects to a configured access point on boot. Credentials are
