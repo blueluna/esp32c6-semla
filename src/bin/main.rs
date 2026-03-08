@@ -16,14 +16,11 @@ use embassy_executor::Spawner;
 use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::{Channel, Sender};
-use embassy_sync::rwlock::RwLock;
-use embassy_time::{Delay, Duration, Instant, Timer};
+use embassy_time::{Delay, Duration};
 use embedded_graphics::geometry::Point;
+use embedded_hal::delay::DelayNs;
 use embedded_hal_bus::spi::ExclusiveDevice;
-use esp_bootloader_esp_idf::partitions;
-use esp_bootloader_esp_idf::partitions::{DataPartitionSubType, PartitionType};
+use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig};
 use esp_hal::rng::Rng;
@@ -40,17 +37,18 @@ use esp_hal::{
 };
 use esp_storage::FlashStorage;
 use esp32c6_semla::network::{connection, net_task};
+use esp32c6_semla::storage::Storage;
 use jiff::ToSpan;
-use panic_rtt_target as _;
+use log::{error, info, warn};
 use sntpc::NtpContext;
 use sntpc::NtpTimestampGenerator;
 use sntpc_net_embassy::UdpSocketWrapper;
 use ssd1675::Color;
 
-const BUFFER_SIZE: usize = ROWS as usize * COLS as usize / 8;
-
 const ROWS: u16 = 212;
 const COLS: u8 = 104;
+
+const BUFFER_SIZE: usize = ROWS as usize * COLS as usize / 8;
 
 static mut BLACK_BUFFER: [u8; BUFFER_SIZE] = [0u8; BUFFER_SIZE];
 static mut RED_BUFFER: [u8; BUFFER_SIZE] = [0u8; BUFFER_SIZE];
@@ -87,25 +85,35 @@ const PASSWORD: &str = env!("PASSWORD");
 const CONFIG_WIFI_SSID: u8 = 0x10;
 const CONFIG_WIFI_PASSWORD: u8 = 0x11;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct DisplayState {
-    time: u64,
-}
-
-static DISPLAY_CHANNEL: Channel<CriticalSectionRawMutex, DisplayState, 4> = Channel::new();
-
 #[allow(
     clippy::large_stack_frames,
     reason = "it's not unusual to allocate larger buffers etc. in main"
 )]
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
-    rtt_target::rtt_init_defmt!();
+    esp_println::logger::init_logger_from_env();
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    let rtc = Rtc::new(peripherals.LPWR);
+    let wake_reason = esp_hal::rtc_cntl::wakeup_cause();
+    match wake_reason {
+        esp_hal::system::SleepSource::Timer => info!("Woke up from timer!"),
+        esp_hal::system::SleepSource::Ulp => info!("Woke up from ULP!"),
+        esp_hal::system::SleepSource::Gpio => info!("Woke up from GPIO!"),
+        esp_hal::system::SleepSource::Ext0 => info!("Woke up from EXT0!"),
+        esp_hal::system::SleepSource::Ext1 => info!("Woke up from EXT1!"),
+        esp_hal::system::SleepSource::TouchPad => info!("Woke up from touchpad!"),
+        esp_hal::system::SleepSource::Undefined => info!("Woke up from undefined source!"),
+        esp_hal::system::SleepSource::All => info!("Woke up from multiple sources!"),
+        esp_hal::system::SleepSource::Uart => info!("Woke up from UART!"),
+        esp_hal::system::SleepSource::Wifi => info!("Woke up from WiFi!"),
+        esp_hal::system::SleepSource::BT => info!("Woke up from BT!"),
+        esp_hal::system::SleepSource::Cocpu => info!("Woke up from CoCPU!"),
+        esp_hal::system::SleepSource::CocpuTrapTrig => info!("Woke up from CoCPU!"),
+    }
+
+    let mut rtc = Rtc::new(peripherals.LPWR);
 
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
 
@@ -114,192 +122,57 @@ async fn main(spawner: Spawner) -> ! {
         esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
 
+    let environment_ssid = String::from(SSID);
+    let environment_password = String::from(PASSWORD);
+
     let mut flash = FlashStorage::new(peripherals.FLASH);
-
-    let mut pt_mem = [0u8; partitions::PARTITION_TABLE_MAX_LEN];
-    let partition_table = partitions::read_partition_table(&mut flash, &mut pt_mem).unwrap();
-
-    let mut configuration_partition_0 = usize::MAX;
-    // let mut configuration_partition_1 = usize::MAX;
-
-    for n in 0..partition_table.len() {
-        let entry = partition_table.get_partition(n).unwrap();
-
-        if entry.partition_type() == PartitionType::Data(DataPartitionSubType::Spiffs) {
-            if entry.label_as_str() == "cfg_0" {
-                configuration_partition_0 = n;
-            }
-            if entry.label_as_str() == "cfg_1" {
-                // configuration_partition_1 = n;
-            }
-        }
-    }
-
-    let (wifi_ssid, wifi_password) = if configuration_partition_0 < usize::MAX {
-        match partition_table.get_partition(configuration_partition_0) {
-            Ok(partition) => {
-                use embassy_embedded_hal::adapter::BlockingAsync;
-                use sequential_storage::cache::KeyPointerCache;
-                use sequential_storage::map::{MapConfig, MapStorage};
-                let region = partition.as_embedded_storage(&mut flash);
-                let storage = BlockingAsync::new(region);
-
-                /*
-                defmt::info!("Erasing configuration partition 0...");
-
-                storage
-                    .erase(0, 0x2000)
-                    .await
-                    .expect("Failed to erase storage");
-                */
-
-                const MAP_FLASH_RANGE: core::ops::Range<u32> = 0x000000..0x002000;
-
-                let mut map_storage = MapStorage::new(
-                    storage,
-                    const { MapConfig::new(MAP_FLASH_RANGE) },
-                    KeyPointerCache::<4, u8, 8>::new(),
-                );
-
-                let mut scratch = [0u8; 128];
-                let wifi_ssid = match map_storage
-                    .fetch_item::<String>(&mut scratch, &CONFIG_WIFI_SSID)
-                    .await
-                {
-                    Ok(Some(ssid)) => {
-                        defmt::info!("Loaded Wi-Fi SSID from storage: '{}'", &ssid);
-                        ssid
+    let (wifi_ssid, wifi_password) = match Storage::new(&mut flash) {
+        Some(mut storage) => {
+            match (
+                storage.get_string(CONFIG_WIFI_SSID).await,
+                storage.get_string(CONFIG_WIFI_PASSWORD).await,
+            ) {
+                (Some(ssid), Some(password)) => {
+                    info!("Loaded Wi-Fi credentials from storage");
+                    (ssid, password)
+                }
+                (Some(ssid), None) => {
+                    if !environment_password.is_empty() {
+                        storage
+                            .set_string(CONFIG_WIFI_PASSWORD, environment_password.clone())
+                            .await;
                     }
-                    Ok(None) => {
-                        let ssid = String::from(SSID);
-                        defmt::warn!("Wi-Fi SSID not found in storage");
-                        if !ssid.is_empty() {
-                            match map_storage
-                                .store_item(&mut scratch, &CONFIG_WIFI_SSID, &ssid)
-                                .await
-                            {
-                                Ok(()) => {
-                                    defmt::info!("Stored default Wi-Fi SSID to storage");
-                                }
-                                Err(_) => {
-                                    defmt::warn!("Failed to store default Wi-Fi SSID to storage");
-                                }
-                            }
-                        }
-                        ssid
+                    (ssid, environment_password)
+                }
+                (None, Some(password)) => {
+                    if !environment_ssid.is_empty() {
+                        storage
+                            .set_string(CONFIG_WIFI_SSID, environment_ssid.clone())
+                            .await;
                     }
-                    Err(error) => {
-                        match error {
-                            sequential_storage::Error::Storage { value } => {
-                                defmt::warn!("Storage error while loading Wi-Fi SSID: {:?}", value);
-                            }
-                            sequential_storage::Error::FullStorage => {
-                                defmt::warn!("Storage full error while loading Wi-Fi SSID");
-                            }
-                            sequential_storage::Error::Corrupted {} => {
-                                defmt::warn!("Corrupted data error while loading Wi-Fi SSID");
-                            }
-                            sequential_storage::Error::LogicBug {} => {
-                                defmt::warn!("Logic bug error while loading Wi-Fi SSID");
-                            }
-                            sequential_storage::Error::BufferTooBig => {
-                                defmt::warn!("Wi-Fi SSID buffer too big");
-                            }
-                            sequential_storage::Error::BufferTooSmall(size) => {
-                                defmt::warn!("Wi-Fi SSID buffer too small, need {} bytes", size);
-                            }
-                            sequential_storage::Error::SerializationError(error) => {
-                                defmt::warn!("Wi-Fi SSID serialization error: {:?}", error);
-                            }
-                            sequential_storage::Error::ItemTooBig => {
-                                defmt::warn!("Wi-Fi SSID item too big");
-                            }
-                            _ => {
-                                defmt::warn!("Unknown error while loading Wi-Fi SSID");
-                            }
-                        }
-                        String::from(SSID)
+                    (environment_ssid, password)
+                }
+                _ => {
+                    if !environment_ssid.is_empty() {
+                        storage
+                            .set_string(CONFIG_WIFI_SSID, environment_ssid.clone())
+                            .await;
                     }
-                };
-
-                let wifi_password = match map_storage
-                    .fetch_item::<String>(&mut scratch, &CONFIG_WIFI_PASSWORD)
-                    .await
-                {
-                    Ok(Some(password)) => {
-                        defmt::info!("Loaded Wi-Fi password from storage");
-                        password
+                    if !environment_password.is_empty() {
+                        storage
+                            .set_string(CONFIG_WIFI_PASSWORD, environment_password.clone())
+                            .await;
                     }
-                    Ok(None) => {
-                        defmt::warn!("Wi-Fi password not found in storage");
-                        let password = String::from(PASSWORD);
-                        if !password.is_empty() {
-                            match map_storage
-                                .store_item(&mut scratch, &CONFIG_WIFI_PASSWORD, &password)
-                                .await
-                            {
-                                Ok(()) => {
-                                    defmt::info!("Stored default Wi-Fi password to storage");
-                                }
-                                Err(_) => {
-                                    defmt::warn!(
-                                        "Failed to store default Wi-Fi password to storage"
-                                    );
-                                }
-                            }
-                        }
-                        String::from(PASSWORD)
-                    }
-                    Err(error) => {
-                        match error {
-                            sequential_storage::Error::Storage { value } => {
-                                defmt::warn!(
-                                    "Storage error while loading Wi-Fi password: {:?}",
-                                    value
-                                );
-                            }
-                            sequential_storage::Error::FullStorage => {
-                                defmt::warn!("Storage full error while loading Wi-Fi password");
-                            }
-                            sequential_storage::Error::Corrupted {} => {
-                                defmt::warn!("Corrupted data error while loading Wi-Fi password");
-                            }
-                            sequential_storage::Error::LogicBug {} => {
-                                defmt::warn!("Logic bug error while loading Wi-Fi password");
-                            }
-                            sequential_storage::Error::BufferTooBig => {
-                                defmt::warn!("Wi-Fi password buffer too big");
-                            }
-                            sequential_storage::Error::BufferTooSmall(size) => {
-                                defmt::warn!(
-                                    "Wi-Fi password buffer too small, need {} bytes",
-                                    size
-                                );
-                            }
-                            sequential_storage::Error::SerializationError(error) => {
-                                defmt::warn!("Wi-Fi password serialization error: {:?}", error);
-                            }
-                            sequential_storage::Error::ItemTooBig => {
-                                defmt::warn!("Wi-Fi password item too big");
-                            }
-                            _ => {
-                                defmt::warn!("Unknown error while loading Wi-Fi password");
-                            }
-                        }
-                        String::from(PASSWORD)
-                    }
-                };
-                (wifi_ssid, wifi_password)
-            }
-            Err(e) => {
-                defmt::error!("Failed to get configuration partition 0: {:?}", e);
-                (String::from(SSID), String::from(PASSWORD))
+                    (environment_ssid, environment_password)
+                }
             }
         }
-    } else {
-        defmt::warn!("No configuration partition found");
-        (String::from(SSID), String::from(PASSWORD))
+        None => (environment_ssid, environment_password),
     };
+
+    if wifi_ssid.is_empty() || wifi_password.is_empty() {
+        warn!("Wi-Fi credentials not set. Please set SSID and PASSWORD environment variables.");
+    }
 
     static ESP_RADIO_CONTROLLER: static_cell::StaticCell<esp_radio::Controller> =
         static_cell::StaticCell::new();
@@ -385,6 +258,11 @@ async fn main(spawner: Spawner) -> ! {
     let red_buffer = unsafe { &mut RED_BUFFER[..] };
     let mut display_graphics = ssd1675::GraphicDisplay::new(display, black_buffer, red_buffer);
 
+    match display_graphics.reset(&mut epd_delay) {
+        Ok(_) => info!("Display reset"),
+        Err(_) => error!("Failed to reset display"),
+    }
+
     display_graphics.clear(Color::White);
 
     display_graphics
@@ -392,50 +270,42 @@ async fn main(spawner: Spawner) -> ! {
         .expect("display reset");
 
     static NET_STACK: static_cell::StaticCell<embassy_net::Stack> = static_cell::StaticCell::new();
-    static RTC: static_cell::StaticCell<Rtc> = static_cell::StaticCell::new();
 
     let _ = spawner.spawn(connection(wifi_controller, wifi_ssid, wifi_password));
     let _ = spawner.spawn(net_task(net_runner));
 
-    let _ = spawner.spawn(network_stack(
-        NET_STACK.init(net_stack),
-        RTC.init(rtc),
-        DISPLAY_CHANNEL.sender(),
-    ));
+    let time = get_ntp_time(NET_STACK.init(net_stack)).await;
 
-    let mut year = 0;
-    let mut fettisdag = jiff::civil::date(1970, 1, 1);
+    info!("Display...");
 
-    loop {
-        let state = DISPLAY_CHANNEL.receive().await;
+    display_graphics.clear(Color::White);
 
-        let timestamp = jiff::Timestamp::from_microsecond(state.time as i64).unwrap();
+    let small_font = u8g2_fonts::FontRenderer::new::<u8g2_fonts::fonts::u8g2_font_logisoso16_tf>();
+
+    let big_font = u8g2_fonts::FontRenderer::new::<u8g2_fonts::fonts::u8g2_font_logisoso38_tf>();
+
+    use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
+
+    let sleep_seconds = if let Some(time) = time {
+        let timestamp = jiff::Timestamp::from_microsecond(time as i64).unwrap();
         let datetime = timestamp.to_zoned(TIMEZONE).datetime();
 
-        if datetime.year() != year {
-            fettisdag = get_fettisdag_date(datetime.year());
-            if fettisdag < datetime.date() {
-                defmt::info!("Fettisdag has passed, calculating for next year");
-                fettisdag = get_fettisdag_date(datetime.year() + 1);
-            }
-            year = datetime.year();
-        }
+        let fettisdag = get_fettisdag_date(datetime.year());
+        let fettisdag = if fettisdag < datetime.date() {
+            // If we've already passed Fettisdag this year, calculate for next year
+            get_fettisdag_date(datetime.year() + 1)
+        } else {
+            fettisdag
+        };
 
         let days_until_fettisdag = (fettisdag - datetime.date()).get_days();
 
-        display_graphics.clear(Color::White);
+        let date_str = format_date(&timestamp);
 
-        let small_font =
-            u8g2_fonts::FontRenderer::new::<u8g2_fonts::fonts::u8g2_font_logisoso16_tf>();
-
-        let big_font =
-            u8g2_fonts::FontRenderer::new::<u8g2_fonts::fonts::u8g2_font_logisoso38_tf>();
-
-        let time = jiff::Timestamp::from_microsecond(state.time as i64).unwrap();
-        let date_str = format_date(&time);
-        let _time_str = format_time(&time);
-
-        use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
+        info!(
+            "Current date: {}, Days until Fettisdagen: {}",
+            date_str, days_until_fettisdag
+        );
 
         let pos = Point::new(ROWS as i32 / 2, 20);
 
@@ -478,10 +348,43 @@ async fn main(spawner: Spawner) -> ! {
             )
             .expect("font render");
 
-        display_graphics
-            .update(&mut epd_delay)
-            .expect("display update");
+        let next_day = datetime.date().tomorrow().unwrap();
+        let midnight = next_day.at(0, 0, 0, 0);
+        let until_midnight = datetime.duration_until(midnight);
+        let seconds_until_midnight = until_midnight.as_secs() as u64;
+        seconds_until_midnight
+    } else {
+        let pos = Point::new(ROWS as i32 / 2, COLS as i32 / 2);
+        small_font
+            .render_aligned(
+                "Failed to get time",
+                pos,
+                VerticalPosition::Center,
+                HorizontalAlignment::Center,
+                FontColor::Transparent(Color::Black),
+                &mut display_graphics,
+            )
+            .expect("font render");
+        info!("Failed to get time");
+        60 * 5
+    };
+
+    info!("Updating display...");
+
+    display_graphics
+        .update(&mut epd_delay)
+        .expect("display update");
+
+    info!("Display updated");
+
+    match display_graphics.deep_sleep() {
+        Ok(_) => info!("Display put into deep sleep"),
+        Err(_) => error!("Failed to put display into deep sleep"),
     }
+
+    let mut sleep_delay = embassy_time::Delay;
+    info!("Entering deep sleep for {} seconds", sleep_seconds);
+    enter_deep_sleep(&mut rtc, &mut sleep_delay, sleep_seconds);
 }
 
 const NTP_SERVER: &str = "pool.ntp.org";
@@ -492,14 +395,13 @@ const USEC_IN_SEC: u64 = 1_000_000;
 const TIMEZONE: jiff::tz::TimeZone = jiff::tz::get!("Europe/Stockholm");
 
 #[derive(Clone, Copy)]
-struct Timestamp<'a> {
-    rtc: &'a Rtc<'a>,
+struct Timestamp {
     current_time_us: u64,
 }
 
-impl NtpTimestampGenerator for Timestamp<'_> {
+impl NtpTimestampGenerator for Timestamp {
     fn init(&mut self) {
-        self.current_time_us = self.rtc.current_time_us();
+        self.current_time_us = 0;
     }
 
     fn timestamp_sec(&self) -> u64 {
@@ -511,35 +413,9 @@ impl NtpTimestampGenerator for Timestamp<'_> {
     }
 }
 
-static INSTANCE_OFFSET_US: RwLock<CriticalSectionRawMutex, u64> = RwLock::new(0);
-
-fn format_zoned(ts: &jiff::Zoned) -> heapless::String<32> {
-    uformat!(
-        32,
-        "{:4}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
-        ts.year(),
-        ts.month(),
-        ts.day(),
-        ts.hour(),
-        ts.minute(),
-        ts.second(),
-        ts.millisecond()
-    )
-    .unwrap()
-}
-
-fn format_timestamp(ts: &jiff::Timestamp) -> heapless::String<32> {
-    format_zoned(&ts.to_zoned(TIMEZONE))
-}
-
 fn format_date(ts: &jiff::Timestamp) -> heapless::String<16> {
     let utc = ts.to_zoned(TIMEZONE);
     uformat!(16, "{:4}-{:02}-{:02}", utc.year(), utc.month(), utc.day(),).unwrap()
-}
-
-fn format_time(ts: &jiff::Timestamp) -> heapless::String<8> {
-    let utc = ts.to_zoned(TIMEZONE);
-    uformat!(8, "{:02}:{:02}", utc.hour(), utc.minute(),).unwrap()
 }
 
 /// Returns the (month, day) of Easter Sunday for the given year using the
@@ -567,29 +443,21 @@ fn get_fettisdag_date(year: i16) -> jiff::civil::Date {
     get_easter_date(year as i32) - 47.days()
 }
 
-#[embassy_executor::task]
-pub async fn network_stack(
-    stack: &'static embassy_net::Stack<'static>,
-    rtc: &'static Rtc<'static>,
-    channel: Sender<'static, CriticalSectionRawMutex, DisplayState, 4>,
-) {
-    defmt::info!("Hardware address: {:?}", stack.hardware_address());
+pub async fn get_ntp_time(stack: &'static embassy_net::Stack<'static>) -> Option<u64> {
+    info!("Hardware address: {:?}", stack.hardware_address());
 
     stack.wait_link_up().await;
-    defmt::info!("Link is up");
+    info!("Link is up");
     stack.wait_config_up().await;
-    defmt::info!("Network configured");
+    info!("Network configured");
 
-    defmt::info!("Query DNS for NTP server address: {}", NTP_SERVER);
+    info!("Query DNS for NTP server address: {}", NTP_SERVER);
 
     let ntp_addrs = stack.dns_query(NTP_SERVER, DnsQueryType::A).await.unwrap();
 
     if ntp_addrs.is_empty() {
         panic!("Failed to resolve DNS. Empty result");
     }
-
-    let now = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64).unwrap();
-    defmt::info!("RTC time {}", format_timestamp(&now));
 
     let mut rx_buffer = [0; 4096];
     let mut tx_buffer = [0; 4096];
@@ -614,54 +482,43 @@ pub async fn network_stack(
     // binding and other required steps
     let ntp_socket = UdpSocketWrapper::from(ntp_socket);
 
-    let mut display_state = DisplayState { time: 0 };
+    let addr: core::net::IpAddr = ntp_addrs[0].into();
+    let time_usec = match sntpc::get_time(
+        core::net::SocketAddr::from((addr, 123)),
+        &ntp_socket,
+        NtpContext::new(Timestamp { current_time_us: 0 }),
+    )
+    .await
+    {
+        Ok(ntp_result) => {
+            let ntp_usec = (u64::from(ntp_result.sec()) * USEC_IN_SEC)
+                + (u64::from(ntp_result.sec_fraction()) * USEC_IN_SEC >> 32);
+            Some(ntp_usec)
+        }
+        Err(e) => {
+            error!("Failed to get NTP time: {:?}", e);
+            None
+        }
+    };
+    time_usec
+}
 
-    const HOUR_SECONDS: u64 = 60 * 60;
-    const HOUR: Duration = Duration::from_secs(HOUR_SECONDS);
+/// Enter deep sleep with timer and KEY button (GPIO4) wake sources
+fn enter_deep_sleep(
+    rtc: &mut esp_hal::rtc_cntl::Rtc,
+    delay: &mut embassy_time::Delay,
+    seconds: u64,
+) -> ! {
+    // Configure wake sources
+    let timer =
+        esp_hal::rtc_cntl::sleep::TimerWakeupSource::new(core::time::Duration::from_secs(seconds));
 
-    loop {
-        let addr: core::net::IpAddr = ntp_addrs[0].into();
-        let expire_at = match sntpc::get_time(
-            core::net::SocketAddr::from((addr, 123)),
-            &ntp_socket,
-            NtpContext::new(Timestamp {
-                rtc: &rtc,
-                current_time_us: 0,
-            }),
-        )
-        .await
-        {
-            Ok(ntp_result) => {
-                let current_elapsed = Instant::now();
-                let ntp_usec = (u64::from(ntp_result.sec()) * USEC_IN_SEC)
-                    + (u64::from(ntp_result.sec_fraction()) * USEC_IN_SEC >> 32);
-                let instance_offset_us = ntp_usec - current_elapsed.as_micros();
-                {
-                    let mut writer = INSTANCE_OFFSET_US.write().await;
-                    *writer = instance_offset_us;
-                }
-                let ntp_now = jiff::Timestamp::from_microsecond(ntp_usec as i64).unwrap();
+    let sleep_cfg = esp_hal::rtc_cntl::sleep::RtcSleepConfig::deep();
 
-                let datetime = ntp_now.to_zoned(TIMEZONE).datetime();
-                let next_day = datetime.date().tomorrow().unwrap();
-                let midnight = next_day.at(0, 0, 0, 0);
-                let until_midnight = datetime.duration_until(midnight);
-                let seconds_until_midnight = until_midnight.as_secs() as u64;
-                let midnight_instant =
-                    current_elapsed + Duration::from_secs(seconds_until_midnight);
-                display_state.time = ntp_usec;
-                midnight_instant
-            }
-            Err(e) => {
-                defmt::error!("Failed to get NTP time: {:?}", e);
-                Instant::now() + HOUR
-            }
-        };
-        channel.send(display_state).await;
-        defmt::info!(
-            "Next NTP update in {} seconds",
-            (expire_at - Instant::now()).as_secs()
-        );
-        Timer::at(expire_at).await;
-    }
+    // Small delay to let serial output flush
+    delay.delay_ms(100);
+
+    // Enter deep sleep (never returns - device reboots on wake)
+    rtc.sleep(&sleep_cfg, &[&timer]);
+    unreachable!();
 }

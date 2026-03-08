@@ -1,8 +1,8 @@
 [target.riscv32imac-unknown-none-elf]
-runner = "probe-rs run --chip=esp32c6 --probe 303a:1001:40:4C:CA:47:29:30 --preverify --always-print-stacktrace --no-location --catch-hardfault --idf-partition-table=partitions.csv"
+runner = "espflash flash --baud 115200 -f 80mhz --monitor --chip esp32c6 --partition-table=partitions.csv"
 
 [env]
-DEFMT_LOG="info"
+ESP_LOG="info"
 SSID=""
 PASSWORD=""
 

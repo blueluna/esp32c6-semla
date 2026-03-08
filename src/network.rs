@@ -1,17 +1,15 @@
 extern crate alloc;
 
 use alloc::string::String;
-use defmt::info;
 use embassy_net::Runner;
 use embassy_time::{Duration, Timer};
 use esp_radio::wifi::{
     ClientConfig, ModeConfig, ScanConfig, WifiController, WifiDevice, WifiEvent, WifiStaState,
 };
+use log::info;
 
 #[embassy_executor::task]
 pub async fn connection(mut controller: WifiController<'static>, ssid: String, password: String) {
-    info!("start connection task");
-    info!("Device capabilities: {:?}", controller.capabilities());
     loop {
         match esp_radio::wifi::sta_state() {
             WifiStaState::Connected => {
@@ -22,6 +20,7 @@ pub async fn connection(mut controller: WifiController<'static>, ssid: String, p
             _ => {}
         }
         if !matches!(controller.is_started(), Ok(true)) {
+            info!("Associate to wifi network: {} {}", ssid, password);
             let client_config = ModeConfig::Client(
                 ClientConfig::default()
                     .with_ssid(ssid.clone())
