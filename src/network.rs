@@ -4,9 +4,9 @@ use alloc::string::String;
 use embassy_net::Runner;
 use embassy_time::{Duration, Timer};
 use esp_radio::wifi::{
-    ClientConfig, ModeConfig, ScanConfig, WifiController, WifiDevice, WifiEvent, WifiStaState,
+    ClientConfig, ModeConfig, WifiController, WifiDevice, WifiEvent, WifiStaState,
 };
-use log::info;
+use defmt::info;
 
 #[embassy_executor::task]
 pub async fn connection(mut controller: WifiController<'static>, ssid: String, password: String) {
@@ -20,28 +20,16 @@ pub async fn connection(mut controller: WifiController<'static>, ssid: String, p
             _ => {}
         }
         if !matches!(controller.is_started(), Ok(true)) {
-            info!("Associate to wifi network: {} {}", ssid, password);
             let client_config = ModeConfig::Client(
                 ClientConfig::default()
                     .with_ssid(ssid.clone())
                     .with_password(password.clone()),
             );
             controller.set_config(&client_config).unwrap();
-            info!("Starting wifi");
             controller.start_async().await.unwrap();
             info!("Wifi started!");
-
-            info!("Scan");
-            let scan_config = ScanConfig::default().with_max(10);
-            let result = controller
-                .scan_with_config_async(scan_config)
-                .await
-                .unwrap();
-            for ap in result {
-                info!("{:?}", ap);
-            }
         }
-        info!("About to connect...");
+        info!("Associate with wifi network: {}", ssid);
 
         match controller.connect_async().await {
             Ok(_) => info!("Wifi connected!"),

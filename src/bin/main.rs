@@ -20,7 +20,6 @@ use embassy_time::{Delay, Duration};
 use embedded_graphics::geometry::Point;
 use embedded_hal::delay::DelayNs;
 use embedded_hal_bus::spi::ExclusiveDevice;
-use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig};
 use esp_hal::rng::Rng;
@@ -39,11 +38,13 @@ use esp_storage::FlashStorage;
 use esp32c6_semla::network::{connection, net_task};
 use esp32c6_semla::storage::Storage;
 use jiff::ToSpan;
-use log::{error, info, warn};
+use defmt::{error, info, warn};
 use sntpc::NtpContext;
 use sntpc::NtpTimestampGenerator;
 use sntpc_net_embassy::UdpSocketWrapper;
 use ssd1675::Color;
+
+use {panic_rtt_target as _};
 
 const ROWS: u16 = 212;
 const COLS: u8 = 104;
@@ -91,7 +92,7 @@ const CONFIG_WIFI_PASSWORD: u8 = 0x11;
 )]
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
-    esp_println::logger::init_logger_from_env();
+    rtt_target::rtt_init_defmt!();
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
@@ -133,7 +134,6 @@ async fn main(spawner: Spawner) -> ! {
                 storage.get_string(CONFIG_WIFI_PASSWORD).await,
             ) {
                 (Some(ssid), Some(password)) => {
-                    info!("Loaded Wi-Fi credentials from storage");
                     (ssid, password)
                 }
                 (Some(ssid), None) => {
@@ -244,7 +244,7 @@ async fn main(spawner: Spawner) -> ! {
             rows: ROWS,
             cols: COLS,
         })
-        .rotation(ssd1675::Rotation::Rotate270)
+        .rotation(ssd1675::Rotation::Rotate90)
         .lut(&LUT_BW)
         .build()
     {
@@ -259,7 +259,7 @@ async fn main(spawner: Spawner) -> ! {
     let mut display_graphics = ssd1675::GraphicDisplay::new(display, black_buffer, red_buffer);
 
     match display_graphics.reset(&mut epd_delay) {
-        Ok(_) => info!("Display reset"),
+        Ok(_) => (),
         Err(_) => error!("Failed to reset display"),
     }
 
@@ -275,8 +275,6 @@ async fn main(spawner: Spawner) -> ! {
     let _ = spawner.spawn(net_task(net_runner));
 
     let time = get_ntp_time(NET_STACK.init(net_stack)).await;
-
-    info!("Display...");
 
     display_graphics.clear(Color::White);
 
@@ -301,10 +299,11 @@ async fn main(spawner: Spawner) -> ! {
         let days_until_fettisdag = (fettisdag - datetime.date()).get_days();
 
         let date_str = format_date(&timestamp);
+        let time_str = format_time(&timestamp);
 
         info!(
-            "Current date: {}, Days until Fettisdagen: {}",
-            date_str, days_until_fettisdag
+            "Current time: {} {}, Days until Fettisdagen: {}",
+            date_str, time_str, days_until_fettisdag
         );
 
         let pos = Point::new(ROWS as i32 / 2, 20);
@@ -349,7 +348,8 @@ async fn main(spawner: Spawner) -> ! {
             .expect("font render");
 
         let next_day = datetime.date().tomorrow().unwrap();
-        let midnight = next_day.at(0, 0, 0, 0);
+        // 5 minutes after midnight to be sure that it wakes up after the date has changed
+        let midnight = next_day.at(1, 30, 0, 0);
         let until_midnight = datetime.duration_until(midnight);
         let seconds_until_midnight = until_midnight.as_secs() as u64;
         seconds_until_midnight
@@ -365,25 +365,22 @@ async fn main(spawner: Spawner) -> ! {
                 &mut display_graphics,
             )
             .expect("font render");
-        info!("Failed to get time");
+        warn!("Failed to get time");
         60 * 5
     };
 
-    info!("Updating display...");
-
-    display_graphics
-        .update(&mut epd_delay)
-        .expect("display update");
-
-    info!("Display updated");
-
+    match display_graphics.update(&mut epd_delay) {
+        Ok(_) => (),
+        Err(_) => error!("Failed to update display"),
+    }
     match display_graphics.deep_sleep() {
-        Ok(_) => info!("Display put into deep sleep"),
+        Ok(_) => (),
         Err(_) => error!("Failed to put display into deep sleep"),
     }
 
     let mut sleep_delay = embassy_time::Delay;
-    info!("Entering deep sleep for {} seconds", sleep_seconds);
+    let sleep_text = format_seconds(&sleep_seconds);
+    info!("Entering deep sleep for {}", sleep_text);
     enter_deep_sleep(&mut rtc, &mut sleep_delay, sleep_seconds);
 }
 
@@ -418,6 +415,18 @@ fn format_date(ts: &jiff::Timestamp) -> heapless::String<16> {
     uformat!(16, "{:4}-{:02}-{:02}", utc.year(), utc.month(), utc.day(),).unwrap()
 }
 
+fn format_time(ts: &jiff::Timestamp) -> heapless::String<8> {
+    let utc = ts.to_zoned(TIMEZONE);
+    uformat!(8, "{:02}:{:02}", utc.hour(), utc.minute(),).unwrap()
+}
+
+fn format_seconds(seconds: &u64) -> heapless::String<16> {
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    uformat!(16, "{:02}:{:02}:{:02}", hours, minutes, seconds).unwrap()
+}
+
 /// Returns the (month, day) of Easter Sunday for the given year using the
 /// Meeus/Jones/Butcher algorithm.
 fn get_easter_date(year: i32) -> jiff::civil::Date {
@@ -445,18 +454,16 @@ fn get_fettisdag_date(year: i16) -> jiff::civil::Date {
 
 pub async fn get_ntp_time(stack: &'static embassy_net::Stack<'static>) -> Option<u64> {
     info!("Hardware address: {:?}", stack.hardware_address());
-
     stack.wait_link_up().await;
     info!("Link is up");
     stack.wait_config_up().await;
     info!("Network configured");
 
-    info!("Query DNS for NTP server address: {}", NTP_SERVER);
-
     let ntp_addrs = stack.dns_query(NTP_SERVER, DnsQueryType::A).await.unwrap();
 
     if ntp_addrs.is_empty() {
-        panic!("Failed to resolve DNS. Empty result");
+        warn!("Failed to resolve DNS. Empty result");
+        return None;
     }
 
     let mut rx_buffer = [0; 4096];
